@@ -1,0 +1,187 @@
+Overlap the host-staged all-reduce of row-parallel layers with their GEMM (fork).
+
+The host-staged all-reduce (host-staged-allreduce.patch) moves data on the copy
+engines, so the SMs are free while it runs -- but each all-reduce waited for the
+whole GEMM before it, and the next layer waited for it. With
+VLLM_ALLREDUCE_HOST_STAGED_OVERLAP=N a row-parallel layer (o_proj, down_proj,
+the GDN out_proj) computes its tokens in N pieces through the custom op
+vllm::row_parallel_overlap (opaque to torch.compile, layer looked up by prefix)
+and starts each piece's all-reduce while the next piece's GEMM runs. The backend
+gets start()/finish(); all_reduce() is both. Pieces below the backend's minimum
+size, CUDA-graph captures (decode) and setups without the backend fall back to
+one GEMM + all-reduce. Lossless.
+
+2x RTX 3090, TP=2, CTX=fast, INT8_ACT=int8 INT8_LAYERS=mlp, warm prefill tok/s:
+  2k / 8k / 32k   off 2,670 (8k), 2,405 (32k)
+  N=2             2,756 / 2,788 / 2,498
+  N=4             2,581 / 2,782 / 2,543
+The launchers set N=2 at --tensor-parallel-size 2.
+
+--- fork: hand-written against the installed series (0.30.0 + every patch above it in patches/series) ---
+diff -ruN a/distributed/device_communicators/host_staged_all_reduce.py b/distributed/device_communicators/host_staged_all_reduce.py
+--- a/distributed/device_communicators/host_staged_all_reduce.py	2026-10-02 06:35:52.783993873 +0200
++++ b/distributed/device_communicators/host_staged_all_reduce.py	2026-10-02 06:36:34.959617974 +0200
+@@ -227,6 +227,14 @@
+         return not torch.cuda.is_current_stream_capturing()
+ 
+     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
++        return self.finish(self.start(inp))
++
++    def start(self, inp: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.cuda.Event, ...]]:
++        """Queue the all-reduce of inp on the side streams and return at once.
++
++        The current stream does not wait: work queued on it before finish()
++        overlaps the copies (they run on the copy engines, not the SMs). The
++        result must not be read or written before finish(handle)."""
+         out = inp.clone()
+         self.seq += 1
+         seq, slot = self.seq, self.seq % _SLOTS
+@@ -269,8 +277,16 @@
+             theirs.copy_(res_peer, non_blocking=True)
+         s_recv.wait_event(added)
+         self._launch(b"set_flag", s_recv, self._flag(_DONE, self.rank, slot), seq)
++        # s_recv has waited for s_add; s_send finished before the peer could
++        # reply; s_res still reads our half and must finish before it changes.
++        return out, (s_recv.record_event(), s_res.record_event())
++
++    def finish(self, handle: tuple[torch.Tensor, tuple[torch.cuda.Event, ...]]) -> torch.Tensor:
++        out, events = handle
++        main = torch.cuda.current_stream()
++        for event in events:
++            main.wait_event(event)
+         for s in self.streams:
+-            main.wait_stream(s)
+             out.record_stream(s)
+         return out
+ 
+Binärdateien a/distributed/device_communicators/__pycache__/host_staged_all_reduce.cpython-311.pyc und b/distributed/device_communicators/__pycache__/host_staged_all_reduce.cpython-311.pyc sind verschieden.
+diff -ruN a/envs.py b/envs.py
+--- a/envs.py	2026-10-02 06:35:53.255989600 +0200
++++ b/envs.py	2026-10-02 06:36:34.959617974 +0200
+@@ -328,6 +328,7 @@
+     VLLM_ALLREDUCE_HOST_STAGED: bool = False
+     VLLM_ALLREDUCE_HOST_STAGED_MIN_KB: int = 1024
+     VLLM_ALLREDUCE_HOST_STAGED_MAX_MB: int = 32
++    VLLM_ALLREDUCE_HOST_STAGED_OVERLAP: int = 0
+     VLLM_TUNED_CONFIG_FOLDER: str | None = None
+     VLLM_ENABLE_STARTUP_PLAN: bool = False
+     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
+@@ -2018,6 +2019,12 @@
+     "VLLM_ALLREDUCE_HOST_STAGED_MAX_MB": lambda: int(
+         os.getenv("VLLM_ALLREDUCE_HOST_STAGED_MAX_MB", "32")
+     ),
++    # Row-parallel layers split their tokens into this many pieces and start
++    # each piece's host-staged all-reduce while the next piece's GEMM runs
++    # (0/1 = off).
++    "VLLM_ALLREDUCE_HOST_STAGED_OVERLAP": lambda: int(
++        os.getenv("VLLM_ALLREDUCE_HOST_STAGED_OVERLAP", "0")
++    ),
+     # Experimental: use this to enable MCP tool calling for non harmony models
+     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
+         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
+diff -ruN a/model_executor/layers/linear.py b/model_executor/layers/linear.py
+--- a/model_executor/layers/linear.py	2026-10-02 06:35:53.019991736 +0200
++++ b/model_executor/layers/linear.py	2026-10-02 06:36:51.743468658 +0200
+@@ -42,6 +42,7 @@
+     RowvLLMParameter,
+ )
+ from vllm.model_executor.utils import set_weight_attrs
++from vllm.utils.torch_utils import direct_register_custom_op
+ from vllm.platforms import current_platform
+ 
+ logger = init_logger(__name__)
+@@ -1618,6 +1619,58 @@
+         )
+ 
+ 
++# Row-parallel layers by prefix, for row_parallel_overlap (a custom op takes no
++# module, so it looks the layer up by name).
++_ROW_PARALLEL_LAYERS: dict[str, "RowParallelLinear"] = {}
++
++
++def row_parallel_overlap(x: torch.Tensor, layer_name: str) -> torch.Tensor:
++    """GEMM + TP all-reduce of a row-parallel layer, with the host-staged
++    all-reduce of each token piece running on the copy engines while the next
++    piece's GEMM runs on the SMs. Falls back to one GEMM + all-reduce when the
++    pieces are too small, inside a CUDA-graph capture, or without the backend."""
++    from vllm.distributed import get_tp_group
++
++    layer = _ROW_PARALLEL_LAYERS[layer_name]
++    bias_ = None if (layer.tp_rank > 0 or layer.skip_bias_add) else layer.bias
++    group = get_tp_group()
++    hs = getattr(group.device_communicator, "hs_ar_comm", None)
++    pieces = envs.VLLM_ALLREDUCE_HOST_STAGED_OVERLAP
++    rows = x.shape[0]
++    step = -(-rows // max(pieces, 1))
++    piece_bytes = step * layer.output_size * x.element_size()
++    if (
++        hs is None
++        or hs.disabled
++        or pieces < 2
++        or x.dim() != 2
++        or rows < pieces
++        or piece_bytes < hs.min_bytes
++        or torch.cuda.is_current_stream_capturing()
++    ):
++        return group._all_reduce_out_place(layer.quant_method.apply(layer, x, bias_))
++    handles = []
++    for i in range(0, rows, step):
++        y = layer.quant_method.apply(layer, x[i : i + step], bias_)
++        if hs.should_use(y):
++            handles.append(hs.start(y))
++        else:
++            handles.append((group._all_reduce_out_place(y), ()))
++    return torch.cat([hs.finish(h) for h in handles])
++
++
++def row_parallel_overlap_fake(x: torch.Tensor, layer_name: str) -> torch.Tensor:
++    layer = _ROW_PARALLEL_LAYERS[layer_name]
++    return x.new_empty((*x.shape[:-1], layer.output_size))
++
++
++direct_register_custom_op(
++    op_name="row_parallel_overlap",
++    op_func=row_parallel_overlap,
++    fake_impl=row_parallel_overlap_fake,
++)
++
++
+ # --8<-- [start:row_parallel_linear]
+ @PluggableLayer.register("row_parallel_linear")
+ class RowParallelLinear(LinearBase):
+@@ -1726,6 +1779,8 @@
+         else:
+             self.register_parameter("bias", None)
+         self.update_param_tp_status()
++        if self.prefix and self.reduce_results:
++            _ROW_PARALLEL_LAYERS[self.prefix] = self
+ 
+     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+         input_dim = getattr(param, "input_dim", None)
+@@ -1770,12 +1825,19 @@
+         # Only fuse bias add into GEMM for rank 0 (this ensures that
+         # bias will not get added more than once in TP>1 case)
+         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+-        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+-
+-        if self.reduce_results and self.tp_size > 1:
+-            output = tensor_model_parallel_all_reduce(output_parallel)
++        if (
++            self.reduce_results
++            and self.tp_size > 1
++            and envs.VLLM_ALLREDUCE_HOST_STAGED_OVERLAP > 1
++            and _ROW_PARALLEL_LAYERS.get(self.prefix) is self
++        ):
++            output = torch.ops.vllm.row_parallel_overlap(input_parallel, self.prefix)
+         else:
+-            output = output_parallel
++            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
++            if self.reduce_results and self.tp_size > 1:
++                output = tensor_model_parallel_all_reduce(output_parallel)
++            else:
++                output = output_parallel
+ 
+         if not self.return_bias:
+             return output
+Binärdateien a/model_executor/layers/__pycache__/linear.cpython-311.pyc und b/model_executor/layers/__pycache__/linear.cpython-311.pyc sind verschieden.
+Binärdateien a/__pycache__/envs.cpython-311.pyc und b/__pycache__/envs.cpython-311.pyc sind verschieden.

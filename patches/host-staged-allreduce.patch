@@ -1,0 +1,429 @@
+Host-staged all-reduce for two GPUs without peer-to-peer access (fork).
+
+Two consumer cards without NVLink (2x RTX 3090 on PCIe 4.0 x16) have no P2P, so
+custom all-reduce is off and NCCL runs the tensor-parallel all-reduce through
+host shared memory with SM-driven copies at ~3.7 GiB/s. A 2048-token prefill
+chunk does 128 all-reduces of 20 MiB (hidden 5120, bf16): 5.3 ms each, ~45% of
+the prefill, and TP=2 prefilled no faster than one card (8k: 1,338 tok/s on two,
+1,350 on one).
+
+This backend maps one shared, pinned host buffer into both ranks and lets the
+copy engines move the data: each rank sends the peer's half of its contribution,
+adds the peer's contribution to its own half and sends the reduced half back,
+1x the tensor out and 1x in per rank. 20 MiB take 1.83 ms against NCCL's 5.23
+(bit-identical result). Cross-rank ordering uses 64-bit sequence flags in the
+shared buffer, written by a one-thread st.release.sys kernel and awaited by a
+one-thread ld.relaxed.sys polling kernel, compiled once with NVRTC to a cubin
+(containers often ship no PTX JIT). Found on the way: cuStreamWriteValue64 on an
+idle stream lands ~2 ms late, cuStreamWaitValue64 polls with a millisecond
+backoff and a stream blocked on a host semaphore stalls the device's other
+streams, and a volatile load of host memory can be served from L2 -- each of
+these alone turned 1.8 ms into 7 ms.
+
+Only large, eager all-reduces use it (VLLM_ALLREDUCE_HOST_STAGED_MIN_KB ..
+_MAX_MB, default 1 MiB .. 32 MiB, never inside a CUDA-graph capture); decode
+stays on PyNCCL. Opt-in: VLLM_ALLREDUCE_HOST_STAGED=1 (the single-user launcher
+sets it at --tensor-parallel-size 2).
+
+Measured (2x RTX 3090, TP=2, single-user dflash2, warm): 8k prefill 1,338 ->
+1,691 tok/s, 32k 1,063 -> 1,241 on the Triton int8-KV profile.
+
+--- fork: hand-written against the installed series (0.30.0 + every patch above it in patches/series) ---
+diff -ruN a/distributed/device_communicators/cuda_communicator.py b/distributed/device_communicators/cuda_communicator.py
+--- a/distributed/device_communicators/cuda_communicator.py	2026-10-02 01:45:20.361293591 +0200
++++ b/distributed/device_communicators/cuda_communicator.py	2026-10-02 01:46:33.660669906 +0200
+@@ -88,6 +88,9 @@
+         from vllm.distributed.device_communicators.flashinfer_pcie_ipc_all_reduce import (  # noqa: E501
+             FlashInferPcieIpcAllReduce,
+         )
++        from vllm.distributed.device_communicators.host_staged_all_reduce import (
++            HostStagedAllReduce,
++        )
+         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+         from vllm.distributed.device_communicators.quick_all_reduce import (
+             QuickAllReduce,
+@@ -108,6 +111,7 @@
+         self.symm_mem_comm: SymmMemCommunicator | None = None
+         self.fi_ar_comm: FlashInferAllReduce | None = None
+         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
++        self.hs_ar_comm: HostStagedAllReduce | None = None
+         self.aiter_ar_comm: AiterCustomAllreduce | None = None
+         self.use_aiter_ag_rs: bool = False
+ 
+@@ -134,6 +138,14 @@
+                 device=self.device,
+             )
+ 
++        if (
++            envs.VLLM_ALLREDUCE_HOST_STAGED
++            and unique_name.split(":")[0] == "tp"
++            and self.world_size == 2
++            and current_platform.is_cuda()
++        ):
++            self.hs_ar_comm = HostStagedAllReduce(group=self.cpu_group, device=self.device)
++
+         if self.use_aiter_allreduce and self.world_size > 1:
+             self.aiter_ar_comm = AiterCustomAllreduce(
+                 group=self.cpu_group,
+@@ -259,6 +271,7 @@
+         depends on the input tensor.
+         """
+         all_potential_ar_backends = [
++            "HOST_STAGED",
+             "FLASHINFER_PCIE_IPC",
+             "FLASHINFER",
+             "NCCL_SYMM_MEM",
+@@ -269,6 +282,8 @@
+             "PYNCCL",
+         ]
+         enabled_ar_backends: list[str] = []
++        if self.hs_ar_comm is not None and not self.hs_ar_comm.disabled:
++            enabled_ar_backends.append("HOST_STAGED")
+         if (
+             self.fi_pcie_ipc_ar_comm is not None
+             and not self.fi_pcie_ipc_ar_comm.disabled
+@@ -325,6 +340,9 @@
+         )
+ 
+     def all_reduce(self, input_):
++        hs_ar_comm = self.hs_ar_comm
++        if hs_ar_comm is not None and hs_ar_comm.should_use(input_):
++            return hs_ar_comm.all_reduce(input_)
+         fi_ar_comm = self.fi_ar_comm
+         use_fi_ar = (
+             fi_ar_comm is not None
+@@ -665,6 +683,9 @@
+         if self.fi_pcie_ipc_ar_comm is not None:
+             self.fi_pcie_ipc_ar_comm.destroy()
+             self.fi_pcie_ipc_ar_comm = None
++        if self.hs_ar_comm is not None:
++            self.hs_ar_comm.destroy()
++            self.hs_ar_comm = None
+         if self.all2all_manager is not None:
+             self.all2all_manager.destroy()
+             self.all2all_manager = None  # type: ignore[assignment]
+diff -ruN a/distributed/device_communicators/host_staged_all_reduce.py b/distributed/device_communicators/host_staged_all_reduce.py
+--- a/distributed/device_communicators/host_staged_all_reduce.py	1970-01-01 01:00:00.000000000 +0100
++++ b/distributed/device_communicators/host_staged_all_reduce.py	2026-10-02 02:46:10.689819832 +0200
+@@ -0,0 +1,286 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Host-staged all-reduce for two GPUs without peer-to-peer access.
++
++Consumer cards (e.g. two RTX 3090 without NVLink) have no P2P, so custom
++all-reduce is off and NCCL moves tensor-parallel all-reduces through host
++shared memory with SM-driven copies: ~3.7 GiB/s, which made the all-reduce
++~45% of a prefill and left TP=2 no faster than one card.
++
++Here both ranks map one shared, pinned host buffer and let the copy engines do
++the work. Each rank owns one half of the tensor: it copies the peer's half of
++its contribution to the host, adds the peer's contribution to its own half, and
++copies the reduced half back for the peer -- 1x the tensor out and 1x in per
++rank, ~1.7 ms for 20 MiB against NCCL's 5.3 ms. Cross-rank ordering uses 64-bit
++sequence flags in the shared buffer, written by a one-thread release-store
++kernel and awaited by a one-thread polling kernel (both compiled once with
++NVRTC; stream memory operations wait with a millisecond backoff, and a stream
++blocked on a host semaphore stalls the device's other streams). The CPU never
++waits.
++
++Used for large, eager all-reduces only (prefill chunks); decode-sized tensors
++and anything inside a CUDA-graph capture stay on PyNCCL.
++"""
++
++import ctypes
++import glob
++import mmap
++import os
++import secrets
++
++import torch
++import torch.distributed as dist
++from torch.distributed import ProcessGroup
++
++import vllm.envs as envs
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_KERNELS_SRC = b"""
++extern "C" __global__ void spin_geq(const unsigned long long* flag, unsigned long long target) {
++    // System-scope load: a volatile load of host memory can be served from L2
++    // and miss the peer's write until the line is evicted.
++    unsigned long long v;
++    for (;;) {
++        asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(v) : "l"(flag) : "memory");
++        if (v >= target) break;
++        __nanosleep(100);
++    }
++}
++
++extern "C" __global__ void set_flag(unsigned long long* flag, unsigned long long value) {
++    // System-scope release: this stream's earlier copies into host memory are
++    // visible before the flag is.
++    asm volatile("st.release.sys.global.u64 [%0], %1;" :: "l"(flag), "l"(value) : "memory");
++}
++"""
++
++_SENT, _RES, _DONE = 0, 1, 2
++_SLOTS = 2
++
++_cuda: ctypes.CDLL | None = None
++_functions: dict = {}
++
++
++def _check(res: int, what: str) -> None:
++    if res != 0:
++        raise RuntimeError(f"{what} failed with error {res}")
++
++
++def _driver() -> ctypes.CDLL:
++    global _cuda
++    if _cuda is None:
++        cu = ctypes.CDLL("libcuda.so.1")
++        cu.cuModuleLoadData.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
++        cu.cuModuleGetFunction.argtypes = [
++            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_char_p
++        ]
++        cu.cuLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [
++            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
++        ]
++        _cuda = cu
++    return _cuda
++
++
++def _nvrtc() -> ctypes.CDLL:
++    import nvidia
++
++    for root in nvidia.__path__:
++        for lib in sorted(glob.glob(os.path.join(root, "*", "lib", "libnvrtc.so*"))):
++            return ctypes.CDLL(lib)
++    return ctypes.CDLL("libnvrtc.so")
++
++
++def _compile_cubin(arch: str) -> bytes:
++    # Straight to a cubin: containers often ship no PTX JIT.
++    nv = _nvrtc()
++    prog = ctypes.c_void_p()
++    _check(nv.nvrtcCreateProgram(ctypes.byref(prog), _KERNELS_SRC, b"hsar.cu", 0, None, None),
++           "nvrtcCreateProgram")
++    try:
++        opts = (ctypes.c_char_p * 1)(f"--gpu-architecture={arch}".encode())
++        if nv.nvrtcCompileProgram(prog, 1, opts) != 0:
++            size = ctypes.c_size_t()
++            nv.nvrtcGetProgramLogSize(prog, ctypes.byref(size))
++            log = ctypes.create_string_buffer(size.value)
++            nv.nvrtcGetProgramLog(prog, log)
++            raise RuntimeError(f"nvrtc: {log.value.decode(errors='replace')}")
++        size = ctypes.c_size_t()
++        _check(nv.nvrtcGetCUBINSize(prog, ctypes.byref(size)), "nvrtcGetCUBINSize")
++        cubin = ctypes.create_string_buffer(size.value)
++        _check(nv.nvrtcGetCUBIN(prog, cubin), "nvrtcGetCUBIN")
++        return cubin.raw
++    finally:
++        nv.nvrtcDestroyProgram(ctypes.byref(prog))
++
++
++def _function(device: torch.device, name: bytes) -> ctypes.c_void_p:
++    key = (device.index, name)
++    fn = _functions.get(key)
++    if fn is None:
++        cu = _driver()
++        mod = _functions.get(device.index)
++        if mod is None:
++            major, minor = torch.cuda.get_device_capability(device)
++            mod = ctypes.c_void_p()
++            _check(cu.cuModuleLoadData(ctypes.byref(mod), _compile_cubin(f"sm_{major}{minor}")),
++                   "cuModuleLoadData")
++            _functions[device.index] = mod
++        fn = ctypes.c_void_p()
++        _check(cu.cuModuleGetFunction(ctypes.byref(fn), mod, name), "cuModuleGetFunction")
++        _functions[key] = fn
++    return fn
++
++
++class HostStagedAllReduce:
++    """All-reduce between two ranks on one node through shared pinned host memory."""
++
++    def __init__(self, group: ProcessGroup, device: torch.device) -> None:
++        self.disabled = True
++        self.group = group
++        self.device = device
++        self.world_size = dist.get_world_size(group)
++        self.rank = dist.get_rank(group)
++        self._mm: mmap.mmap | None = None
++        self._host: torch.Tensor | None = None
++        self._ptr = 0
++        if self.world_size != 2:
++            logger.warning_once("Host-staged all-reduce supports world_size=2 only; disabled.")
++            return
++        self.peer = 1 - self.rank
++        index = device.index if device.index is not None else torch.cuda.current_device()
++        devices: list = [None, None]
++        dist.all_gather_object(devices, index, group=group)
++        if torch.cuda.can_device_access_peer(index, devices[self.peer]):
++            logger.info_once("GPUs have P2P access; host-staged all-reduce stays off "
++                             "(custom all-reduce is faster).")
++            return
++        self.min_bytes = envs.VLLM_ALLREDUCE_HOST_STAGED_MIN_KB << 10
++        self.max_bytes = envs.VLLM_ALLREDUCE_HOST_STAGED_MAX_MB << 20
++        half = self.max_bytes // 2
++        self.half_bytes = half
++        data_bytes = 2 * 2 * _SLOTS * half  # (send, res) x rank x slot
++        total = data_bytes + 3 * 2 * _SLOTS * 8
++        self._flags_off = data_bytes
++
++        # Rank 0 creates a fresh (zeroed) shared file; both map it, then it is unlinked.
++        name = [f"vllm-hsar-{os.getpid()}-{secrets.token_hex(6)}" if self.rank == 0 else None]
++        dist.broadcast_object_list(name, src=dist.get_global_rank(group, 0), group=group)
++        path = f"/dev/shm/{name[0]}"
++        try:
++            if self.rank == 0:
++                fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
++                os.ftruncate(fd, total)
++                os.close(fd)
++            dist.barrier(group=group)
++            fd = os.open(path, os.O_RDWR)
++            self._mm = mmap.mmap(fd, total)
++            os.close(fd)
++            dist.barrier(group=group)
++        finally:
++            if self.rank == 0 and os.path.exists(path):
++                os.unlink(path)
++        host = torch.frombuffer(self._mm, dtype=torch.uint8)
++        self._ptr = host.data_ptr()
++        # cudaHostRegisterPortable | cudaHostRegisterMapped
++        _check(int(torch.cuda.cudart().cudaHostRegister(self._ptr, total, 0x1 | 0x2)),
++               "cudaHostRegister")
++        self._host = host
++        self.seq = 0
++        with torch.cuda.device(device):
++            self.streams = [torch.cuda.Stream() for _ in range(4)]
++            self.tmp = torch.empty(half, dtype=torch.uint8, device=device)
++            _function(device, b"spin_geq")
++            _function(device, b"set_flag")
++        self.disabled = False
++        logger.info(
++            "Host-staged all-reduce enabled for tensors of %d KiB .. %d MiB (2 x %d MiB pinned host)",
++            self.min_bytes >> 10, self.max_bytes >> 20, data_bytes >> 20,
++        )
++
++    # --- buffers and flags ---------------------------------------------------
++    def _region(self, kind: int, rank: int, slot: int) -> torch.Tensor:
++        off = ((kind * 2 + rank) * _SLOTS + slot) * self.half_bytes
++        return self._host[off: off + self.half_bytes]
++
++    def _flag(self, kind: int, rank: int, slot: int) -> int:
++        return self._ptr + self._flags_off + ((kind * 2 + rank) * _SLOTS + slot) * 8
++
++    def _launch(self, name: bytes, stream: torch.cuda.Stream, addr: int, value: int) -> None:
++        a, v = ctypes.c_uint64(addr), ctypes.c_uint64(value)
++        params = (ctypes.c_void_p * 2)(ctypes.cast(ctypes.byref(a), ctypes.c_void_p),
++                                       ctypes.cast(ctypes.byref(v), ctypes.c_void_p))
++        _check(_driver().cuLaunchKernel(_function(self.device, name), 1, 1, 1, 1, 1, 1, 0,
++                                        stream.cuda_stream, params, None), "cuLaunchKernel")
++
++    # --- all-reduce ----------------------------------------------------------
++    def should_use(self, inp: torch.Tensor) -> bool:
++        if self.disabled or not inp.is_cuda or not inp.is_contiguous():
++            return False
++        if inp.dtype not in (torch.bfloat16, torch.float16, torch.float32):
++            return False
++        nbytes = inp.numel() * inp.element_size()
++        if nbytes < self.min_bytes or nbytes > self.max_bytes or inp.numel() % 2:
++            return False
++        # Both ranks reach the same answer: the gates depend on the shape only,
++        # and a CUDA-graph capture happens on both together.
++        return not torch.cuda.is_current_stream_capturing()
++
++    def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
++        out = inp.clone()
++        self.seq += 1
++        seq, slot = self.seq, self.seq % _SLOTS
++        n_half = out.numel() // 2
++        flat = out.view(-1)
++        halves = (flat[:n_half], flat[n_half:])
++        mine, theirs = halves[self.rank], halves[self.peer]
++        nb = n_half * out.element_size()
++        tmp = self.tmp[:nb].view(out.dtype)
++        send_mine = self._region(_SENT, self.rank, slot)[:nb].view(out.dtype)
++        send_peer = self._region(_SENT, self.peer, slot)[:nb].view(out.dtype)
++        res_mine = self._region(_RES, self.rank, slot)[:nb].view(out.dtype)
++        res_peer = self._region(_RES, self.peer, slot)[:nb].view(out.dtype)
++        main = torch.cuda.current_stream()
++        s_send, s_add, s_res, s_recv = self.streams
++        ready = main.record_event()
++        for s in self.streams:
++            s.wait_event(ready)
++        # Our contribution to the peer's half -> host (once the peer has read
++        # this slot's previous use).
++        if seq > _SLOTS:
++            self._launch(b"spin_geq", s_send, self._flag(_DONE, self.peer, slot), seq - _SLOTS)
++        with torch.cuda.stream(s_send):
++            send_mine.copy_(theirs, non_blocking=True)
++        self._launch(b"set_flag", s_send, self._flag(_SENT, self.rank, slot), seq)
++        # The peer's contribution to our half -> device, added in.
++        self._launch(b"spin_geq", s_add, self._flag(_SENT, self.peer, slot), seq)
++        with torch.cuda.stream(s_add):
++            tmp.copy_(send_peer, non_blocking=True)
++            mine.add_(tmp)
++        added = s_add.record_event()
++        # Our reduced half -> host.
++        s_res.wait_event(added)
++        with torch.cuda.stream(s_res):
++            res_mine.copy_(mine, non_blocking=True)
++        self._launch(b"set_flag", s_res, self._flag(_RES, self.rank, slot), seq)
++        # The peer's reduced half -> device; then this slot may be reused.
++        self._launch(b"spin_geq", s_recv, self._flag(_RES, self.peer, slot), seq)
++        with torch.cuda.stream(s_recv):
++            theirs.copy_(res_peer, non_blocking=True)
++        s_recv.wait_event(added)
++        self._launch(b"set_flag", s_recv, self._flag(_DONE, self.rank, slot), seq)
++        for s in self.streams:
++            main.wait_stream(s)
++            out.record_stream(s)
++        return out
++
++    def destroy(self) -> None:
++        if self._ptr:
++            torch.cuda.synchronize(self.device)
++            torch.cuda.cudart().cudaHostUnregister(self._ptr)
++            self._ptr = 0
++        self._host = None
++        if self._mm is not None:
++            self._mm.close()
++            self._mm = None
++        self.disabled = True
+Binärdateien a/distributed/device_communicators/__pycache__/cuda_communicator.cpython-311.pyc und b/distributed/device_communicators/__pycache__/cuda_communicator.cpython-311.pyc sind verschieden.
+Binärdateien a/distributed/device_communicators/__pycache__/host_staged_all_reduce.cpython-311.pyc und b/distributed/device_communicators/__pycache__/host_staged_all_reduce.cpython-311.pyc sind verschieden.
+diff -ruN a/envs.py b/envs.py
+--- a/envs.py	2026-10-02 01:45:20.593291618 +0200
++++ b/envs.py	2026-10-02 01:46:33.660669906 +0200
+@@ -325,6 +325,9 @@
+     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
+     VLLM_ALLREDUCE_USE_FLASHINFER: bool = True
+     VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC: bool = False
++    VLLM_ALLREDUCE_HOST_STAGED: bool = False
++    VLLM_ALLREDUCE_HOST_STAGED_MIN_KB: int = 1024
++    VLLM_ALLREDUCE_HOST_STAGED_MAX_MB: int = 32
+     VLLM_TUNED_CONFIG_FOLDER: str | None = None
+     VLLM_ENABLE_STARTUP_PLAN: bool = False
+     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
+@@ -2003,6 +2006,18 @@
+     "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": lambda: bool(
+         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC", "0"))
+     ),
++    # Host-staged all-reduce for two GPUs without P2P (consumer cards): the TP
++    # all-reduce of tensors between MIN_KB and MAX_MB goes through shared pinned
++    # host memory on the copy engines instead of NCCL's SHM transport.
++    "VLLM_ALLREDUCE_HOST_STAGED": lambda: bool(
++        int(os.getenv("VLLM_ALLREDUCE_HOST_STAGED", "0"))
++    ),
++    "VLLM_ALLREDUCE_HOST_STAGED_MIN_KB": lambda: int(
++        os.getenv("VLLM_ALLREDUCE_HOST_STAGED_MIN_KB", "1024")
++    ),
++    "VLLM_ALLREDUCE_HOST_STAGED_MAX_MB": lambda: int(
++        os.getenv("VLLM_ALLREDUCE_HOST_STAGED_MAX_MB", "32")
++    ),
+     # Experimental: use this to enable MCP tool calling for non harmony models
+     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
+         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
+Binärdateien a/__pycache__/envs.cpython-311.pyc und b/__pycache__/envs.cpython-311.pyc sind verschieden.

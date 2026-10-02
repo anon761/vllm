@@ -1,0 +1,21 @@
+Let the int8-QK prefill attention fire for any 6:1 GQA layout (fork).
+
+prefill-attn-int8.patch gates its kernel on the single-card geometry, 24 q-heads
+/ 4 kv-heads. Under --tensor-parallel-size 2 every rank holds 12 / 2 (and 6 / 1
+at TP=4), the same G=6 the kernel was measured on, and it is written over HKV
+and G, so the gate only shut it out. Measured on 2x RTX 3090 at TP=2
+(FLASH_ATTN, bf16 KV, INT8_ACT=int8, host-staged all-reduce): 8k 3,160 -> 3,199
+tok/s, 32k 2,775 -> 2,802, 128k 1,794 -> 1,838.
+
+--- fork: hand-written against the installed series (0.30.0 + every patch above it in patches/series) ---
+--- a/v1/attention/backends/flash_attn.py	2026-10-02 02:45:07.034364242 +0200
++++ b/v1/attention/backends/flash_attn.py	2026-10-02 02:45:07.262362292 +0200
+@@ -1389,7 +1389,7 @@
+                     envs.VLLM_PREFILL_ATTN in ("int8", "fp16")
+                     and max_seqlen_q > 16
+                     and cu_seqlens_q.shape[0] == 2
+-                    and self.num_heads == 24 and self.num_kv_heads == 4
++                    and self.num_kv_heads > 0 and self.num_heads == 6 * self.num_kv_heads
+                     and self.head_size == 256
+                     and not is_quantized_kv_cache(self.kv_cache_dtype)
+                     and (

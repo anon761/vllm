@@ -1,0 +1,67 @@
+Bound the memory spike of prompt_logprobs (fork).
+
+The V2 runner computes prompt logprobs in chunks of 1024 prompt tokens. Each
+chunk's logits span the whole vocabulary (248,320 for Qwen3.8) and the
+top-k/log-softmax temporaries come on top -- more than 1 GiB that the startup
+memory profile never sees. On 2x RTX 3090 at TP=2 with the KV pool sized to
+GPU_UTIL 0.93, quality_battery.py's perplexity requests raised
+torch.OutOfMemoryError in compute_logits and the worker took the whole engine
+down (EngineDeadError) -- any client asking for prompt_logprobs could do that.
+
+VLLM_PROMPT_LOGPROBS_CHUNK sets the chunk (default 1024 as upstream); the
+launchers set 128. The result is identical, the loop just runs more often:
+after the change the same battery runs against the same server (PPL 8.569 as
+before) and 8k / 30k-token prompts with prompt_logprobs=1 return in 3.6 / 14.5 s.
+
+--- fork: hand-written against the installed series (0.30.0 + every patch above it in patches/series) ---
+diff -ruN a/envs.py b/envs.py
+--- a/envs.py	2026-10-02 07:28:29.435752693 +0200
++++ b/envs.py	2026-10-02 07:28:29.459752492 +0200
+@@ -329,6 +329,7 @@
+     VLLM_ALLREDUCE_HOST_STAGED_MIN_KB: int = 1024
+     VLLM_ALLREDUCE_HOST_STAGED_MAX_MB: int = 32
+     VLLM_ALLREDUCE_HOST_STAGED_OVERLAP: int = 0
++    VLLM_PROMPT_LOGPROBS_CHUNK: int = 1024
+     VLLM_TUNED_CONFIG_FOLDER: str | None = None
+     VLLM_ENABLE_STARTUP_PLAN: bool = False
+     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
+@@ -2025,6 +2026,11 @@
+     "VLLM_ALLREDUCE_HOST_STAGED_OVERLAP": lambda: int(
+         os.getenv("VLLM_ALLREDUCE_HOST_STAGED_OVERLAP", "0")
+     ),
++    # Prompt tokens per chunk when computing prompt_logprobs (full-vocabulary
++    # logits per chunk; smaller bounds the memory spike).
++    "VLLM_PROMPT_LOGPROBS_CHUNK": lambda: int(
++        os.getenv("VLLM_PROMPT_LOGPROBS_CHUNK", "1024")
++    ),
+     # Experimental: use this to enable MCP tool calling for non harmony models
+     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
+         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
+Binärdateien a/__pycache__/envs.cpython-311.pyc und b/__pycache__/envs.cpython-311.pyc sind verschieden.
+diff -ruN a/v1/worker/gpu/sample/prompt_logprob.py b/v1/worker/gpu/sample/prompt_logprob.py
+--- a/v1/worker/gpu/sample/prompt_logprob.py	2026-10-02 07:28:29.207754606 +0200
++++ b/v1/worker/gpu/sample/prompt_logprob.py	2026-10-02 07:28:29.455752526 +0200
+@@ -5,6 +5,8 @@
+ import numpy as np
+ import torch
+ 
++import vllm.envs as envs
++
+ from vllm.config.model import LogprobsMode
+ from vllm.sampling_params import SamplingParams
+ from vllm.triton_utils import tl, triton
+@@ -204,8 +206,11 @@
+     logprobs_mode: LogprobsMode = "raw_logprobs",
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     # Since materializing the full prompt logits can take too much memory,
+-    # we compute it in chunks.
+-    CHUNK_SIZE = 1024
++    # we compute it in chunks. A chunk's logits span the whole vocabulary and the
++    # top-k/log-softmax temporaries come on top, none of it in the startup memory
++    # profile: at 1024 tokens and a 248k vocabulary that is >1 GiB, enough to OOM
++    # a card sized for its KV cache and kill the engine.
++    CHUNK_SIZE = max(1, envs.VLLM_PROMPT_LOGPROBS_CHUNK)
+     token_ids = []
+     scores = []
+     ranks = []
+Binärdateien a/v1/worker/gpu/sample/__pycache__/prompt_logprob.cpython-311.pyc und b/v1/worker/gpu/sample/__pycache__/prompt_logprob.cpython-311.pyc sind verschieden.
